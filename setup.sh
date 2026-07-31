@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 027
 
-SCRIPT_VERSION="3.0.0"
+SCRIPT_VERSION="4.0.0"
 SCRIPT_NAME="$(basename "$0")"
 SCRIPT_PATH="$(readlink -f "$0")"
 TMUX_SESSION="vps-setup"
@@ -767,8 +767,23 @@ configure_ufw() {
     echo "The script did not open ports 80, 443, or any VPN ports."
 }
 
+wait_for_fail2ban() {
+    local attempts=${1:-20} i
+
+    for ((i = 1; i <= attempts; i++)); do
+        if fail2ban-client ping >/dev/null 2>&1 \
+            && fail2ban-client status sshd >/dev/null 2>&1; then
+            return 0
+        fi
+        systemctl is-failed --quiet fail2ban.service && return 1
+        sleep 1
+    done
+    return 1
+}
+
 configure_fail2ban() {
     local ignore_line='ignoreip = 127.0.0.1/8 ::1' remote_ip="" port_csv
+    local service_status service_journal
     local -a ports=()
 
     info "Fail2ban for SSH"
@@ -808,9 +823,24 @@ EOF
         die "The Fail2ban configuration failed validation; changes were rolled back."
     fi
 
-    systemctl enable --now fail2ban
-    systemctl restart fail2ban
-    fail2ban-client status sshd >/dev/null
+    if ! systemctl enable fail2ban.service; then
+        restore_snapshot fail2ban_jail
+        systemctl restart fail2ban.service >/dev/null 2>&1 || true
+        die "Fail2ban could not be enabled; the previous jail configuration was restored."
+    fi
+
+    if ! systemctl restart fail2ban.service || ! wait_for_fail2ban 20; then
+        service_status=$(systemctl --no-pager --full status fail2ban.service 2>&1 || true)
+        service_journal=$(journalctl -u fail2ban.service -n 30 --no-pager 2>&1 || true)
+
+        restore_snapshot fail2ban_jail
+        systemctl restart fail2ban.service >/dev/null 2>&1 || true
+
+        printf '%s\n' "----- fail2ban.service status -----" "$service_status" >&2
+        printf '%s\n' "----- recent fail2ban journal -----" "$service_journal" >&2
+        die "Fail2ban did not become ready within 20 seconds; the previous jail configuration was restored."
+    fi
+
     CHANGES+=("Fail2ban configured for SSH ports $port_csv")
 }
 

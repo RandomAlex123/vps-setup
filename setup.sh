@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 027
 
-SCRIPT_VERSION="4.0.0"
+SCRIPT_VERSION="5.0.0"
 SCRIPT_NAME="$(basename "$0")"
 SCRIPT_PATH="$(readlink -f "$0")"
 TMUX_SESSION="vps-setup"
@@ -662,7 +662,7 @@ configure_ssh() {
     echo "Open a NEW local terminal and test the connection without closing the current session."
     if [[ -n $public_key ]]; then
         rendered_private_key=$(format_local_key_path "$local_private_key")
-        printf '  ssh -i %s -o IdentitiesOnly=yes -o PreferredAuthentications=publickey -o PasswordAuthentication=no -p %s %s@%s\n' \
+        printf '  ssh -i %s -p %s %s@%s\n' \
             "$rendered_private_key" "$desired_port" "$target_user" "$server_address"
     else
         printf '  ssh -p %s %s@%s\n' "$desired_port" "$target_user" "$server_address"
@@ -911,6 +911,29 @@ swapfile_is_active() {
         awk '$0 == "/swapfile" {found=1} END {exit !found}'
 }
 
+swap_component_mb() {
+    local component=$1
+
+    swapon --noheadings --raw --bytes --show=NAME,SIZE 2>/dev/null | \
+        awk -v component="$component" '
+            component == "swapfile" && $1 == "/swapfile" {total += $2}
+            component == "existing" && $1 != "/swapfile" {total += $2}
+            END {printf "%.0f\n", total / 1048576}
+        '
+}
+
+print_swap_summary() {
+    local existing_swap_mb swapfile_mb total_swap_mb
+
+    existing_swap_mb=$(swap_component_mb existing)
+    swapfile_mb=$(swap_component_mb swapfile)
+    total_swap_mb=$(free -m | awk '/Swap:/ {value=$2} END {print value+0}')
+
+    printf 'Existing swap devices: %s MB\n' "$existing_swap_mb"
+    printf '/swapfile size:        %s MB\n' "$swapfile_mb"
+    printf 'Total active swap:     %s MB\n' "$total_swap_mb"
+}
+
 configure_swap() {
     local size_mb size_bytes free_bytes reserve_bytes existing_size=0 tmp_swap old_swap
     local mem_available swap_used old_was_active=0 fstab_changed=0
@@ -923,8 +946,9 @@ configure_swap() {
 
     echo "Current swap:"
     swapon --show || true
+    print_swap_summary
     while true; do
-        printf 'Size of /swapfile in MB [press Enter to keep the current configuration]: '
+        printf 'Additional /swapfile size in MB [press Enter to keep the current configuration]: '
         IFS= read -r size_mb || true
         [[ -z $size_mb ]] && { log "Swap size left unchanged."; return 0; }
         if [[ $size_mb =~ ^[0-9]+$ ]] && (( size_mb >= 128 && size_mb <= 131072 )); then
@@ -1058,7 +1082,7 @@ EOF
 
 final_checks() {
     local -a ports=()
-    local ssh_ok="no" ufw_state fail2ban_state swap_mb sysctl_forward bbr docker_state reboot_state
+    local ssh_ok="no" ufw_state fail2ban_state existing_swap_mb swapfile_mb total_swap_mb sysctl_forward bbr docker_state reboot_state
 
     info "Final checks"
 
@@ -1078,8 +1102,9 @@ final_checks() {
         fail2ban_state="not active or not configured"
     fi
 
-    swap_mb=$(free -m | awk '/Swap:/ {print $2}')
-    swap_mb=${swap_mb:-0}
+    existing_swap_mb=$(swap_component_mb existing)
+    swapfile_mb=$(swap_component_mb swapfile)
+    total_swap_mb=$(free -m | awk '/Swap:/ {value=$2} END {print value+0}')
     sysctl_forward=$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo "unknown")
     bbr=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
 
@@ -1106,7 +1131,9 @@ final_checks() {
     echo "SSH port(s):        $(join_by , "${ports[@]}")"
     echo "UFW:                $ufw_state"
     echo "Fail2ban:           $fail2ban_state"
-    echo "Swap total:         ${swap_mb} MB"
+    echo "Existing swap devices: ${existing_swap_mb} MB"
+    echo "/swapfile size:        ${swapfile_mb} MB"
+    echo "Total active swap:     ${total_swap_mb} MB"
     echo "IPv4 forwarding:    $sysctl_forward"
     echo "TCP congestion:     $bbr"
     echo "Docker:             $docker_state"

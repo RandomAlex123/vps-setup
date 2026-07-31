@@ -5,7 +5,73 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 027
 
+SCRIPT_VERSION="3.0.0"
 SCRIPT_NAME="$(basename "$0")"
+SCRIPT_PATH="$(readlink -f "$0")"
+TMUX_SESSION="vps-setup"
+
+bootstrap_tmux() {
+    # Run the interactive setup in tmux
+    [[ -n ${TMUX:-} || ${SETUP_TMUX_REEXEC:-0} == 1 ]] && return 0
+
+    [[ ${EUID:-$(id -u)} -eq 0 ]] || {
+        printf 'ERROR: Run this script as root: sudo bash %s\n' "$SCRIPT_NAME" >&2
+        exit 1
+    }
+    [[ -t 0 && -t 1 ]] || {
+        printf 'WARNING: No interactive terminal detected; continuing without tmux.\n'
+        return 0
+    }
+
+    [[ -r /etc/os-release ]] || {
+        printf 'ERROR: /etc/os-release was not found.\n' >&2
+        exit 1
+    }
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    case "${ID:-}:${VERSION_ID:-}" in
+        ubuntu:22.04|ubuntu:24.04|ubuntu:26.04|debian:11|debian:12|debian:13) ;;
+        *)
+            printf 'ERROR: Unsupported system: %s.\n' "${PRETTY_NAME:-unknown}" >&2
+            exit 1
+            ;;
+    esac
+
+    export DEBIAN_FRONTEND=noninteractive
+    if ! command -v tmux >/dev/null 2>&1; then
+        printf 'Installing tmux before continuing...\n'
+        apt-get -o DPkg::Lock::Timeout=120 update
+        apt-get -o DPkg::Lock::Timeout=120 install -y --no-install-recommends tmux
+    fi
+    command -v tmux >/dev/null 2>&1 || {
+        printf 'ERROR: tmux installation did not complete successfully.\n' >&2
+        exit 1
+    }
+
+    if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+        printf 'Attaching to the existing tmux session: %s\n' "$TMUX_SESSION"
+        exec tmux attach-session -t "$TMUX_SESSION"
+    fi
+
+    local quoted_script quoted_args='' quoted_arg arg tmux_command
+    printf -v quoted_script '%q' "$SCRIPT_PATH"
+    for arg in "$@"; do
+        printf -v quoted_arg '%q' "$arg"
+        quoted_args+=" $quoted_arg"
+    done
+
+    printf -v tmux_command \
+        'env SETUP_TMUX_REEXEC=1 bash %s%s; rc=$?; printf "\\nSetup script finished with exit code %%s.\\n" "$rc"; printf "Press Enter to close this tmux session... "; read -r; exit "$rc"' \
+        "$quoted_script" "$quoted_args"
+
+    printf 'Starting setup version %s inside tmux session: %s\n' "$SCRIPT_VERSION" "$TMUX_SESSION"
+    printf 'If SSH disconnects, reconnect and run: tmux attach -t %s\n' "$TMUX_SESSION"
+    tmux new-session -d -s "$TMUX_SESSION" "$tmux_command"
+    exec tmux attach-session -t "$TMUX_SESSION"
+}
+
+bootstrap_tmux "$@"
+
 RUN_ID="$(date +%Y%m%d-%H%M%S)"
 LOG_FILE="/var/log/setup.log"
 BACKUP_DIR="/var/backups/setup/${RUN_ID}"
@@ -37,6 +103,10 @@ die()  {
 
 on_error() {
     local rc=$? line=${1:-?}
+    # Let the parent shell report command-substitution failures only once.
+    if (( BASH_SUBSHELL > 0 )); then
+        exit "$rc"
+    fi
     printf '\nERROR: command failed with exit code %s at line %s.\n' "$rc" "$line" >&2
     if (( SSH_TX_ACTIVE )); then
         printf 'Rolling back incomplete SSH changes...\n' >&2
@@ -75,12 +145,39 @@ array_contains() {
     return 1
 }
 
+format_local_key_path() {
+    local path=$1 rest
+    if [[ $path =~ ^~/[A-Za-z0-9._/@+:-]+$ ]]; then
+        printf '%s' "$path"
+        return 0
+    fi
+    if [[ $path == '~/'* ]]; then
+        rest=${path#\~/}
+        rest=${rest//\\/\\\\}
+        rest=${rest//\"/\\\"}
+        rest=${rest//\$/\\\$}
+        rest=${rest//\`/\\\`}
+        printf '"$HOME/%s"' "$rest"
+        return 0
+    fi
+    printf '%q' "$path"
+}
+
+trim_whitespace() {
+    local value=$1
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s' "$value"
+}
+
 ask_yes_no() {
     local question=$1 default=${2:-N} answer prompt
+    default=${default^^}
     if [[ $default == Y ]]; then prompt='[Y/n]'; else prompt='[y/N]'; fi
     while true; do
         printf '%s %s ' "$question" "$prompt"
         if ! IFS= read -r answer; then answer=""; fi
+        answer=$(trim_whitespace "$answer")
         answer=${answer:-$default}
         case ${answer,,} in
             y|yes) return 0 ;;
@@ -212,7 +309,7 @@ configure_unattended_upgrades() {
 
     install_packages unattended-upgrades
     write_file_if_changed /etc/apt/apt.conf.d/52setup-auto-upgrades 0644 <<'EOF'
-// Managed by setup.sh
+// Managed by VPS setup script
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
 APT::Periodic::AutocleanInterval "7";
@@ -251,12 +348,13 @@ get_active_ssh_ports_for_rules() {
 
 port_is_listening() {
     local port=$1
-    ss -H -ltn "sport = :$port" 2>/dev/null | grep -q .
+    ss -H -ltn "sport = :$port" 2>/dev/null | awk 'NF {found=1} END {exit !found}'
 }
 
 port_speaks_ssh() {
     local port=$1
-    ssh-keyscan -T 3 -p "$port" 127.0.0.1 2>/dev/null | grep -qE '^[^#].+[[:space:]](ssh-|ecdsa-)'
+    ssh-keyscan -T 3 -p "$port" 127.0.0.1 2>/dev/null | \
+        awk '/^[^#].+[[:space:]](ssh-|ecdsa-)/ {found=1} END {exit !found}'
 }
 
 wait_for_ssh() {
@@ -327,12 +425,14 @@ reload_ssh() {
 }
 
 ufw_is_active() {
-    command -v ufw >/dev/null 2>&1 && LC_ALL=C ufw status 2>/dev/null | grep -q '^Status: active'
+    command -v ufw >/dev/null 2>&1 && \
+        LC_ALL=C ufw status 2>/dev/null | awk '/^Status: active$/ {found=1} END {exit !found}'
 }
 
 ufw_has_explicit_port() {
     local port=$1
-    LC_ALL=C ufw status 2>/dev/null | grep -Eq "^${port}/tcp[[:space:]]+ALLOW"
+    LC_ALL=C ufw status 2>/dev/null | \
+        awk -v port="$port" '$0 ~ ("^" port "/tcp[[:space:]]+ALLOW") {found=1} END {exit !found}'
 }
 
 rollback_ssh() {
@@ -356,7 +456,7 @@ make_ssh_dropin() {
     local password_auth=$1 kbd_auth=$2
     shift 2
     {
-        echo "# Managed by setup.sh"
+        echo "# Managed by VPS setup script"
         for p in "$@"; do echo "Port $p"; done
         echo "PubkeyAuthentication yes"
         echo "PasswordAuthentication $password_auth"
@@ -368,7 +468,7 @@ make_ssh_socket_dropin() {
     local p
     (( SSH_SOCKET_MODE )) || return 0
     {
-        echo "# Managed by setup.sh"
+        echo "# Managed by VPS setup script"
         echo "[Socket]"
         echo "ListenStream="
         for p in "$@"; do echo "ListenStream=$p"; done
@@ -377,7 +477,8 @@ make_ssh_socket_dropin() {
 
 configure_ssh() {
     local default_user target_user user_home user_uid user_gid
-    local public_key="" key_tmp current_password current_kbd disable_password=0
+    local public_key="" key_tmp key_type local_private_key="" default_private_key
+    local rendered_private_key current_password current_kbd sshd_effective disable_password=0
     local change_port=0 desired_port primary_port server_address confirm
     local -a old_ports=() staged_ports=() final_ports=()
 
@@ -420,6 +521,28 @@ configure_ssh() {
             rm -f "$key_tmp"
             echo "Invalid public key. Try again."
         done
+
+        key_type=${public_key%%[[:space:]]*}
+        case "$key_type" in
+            ssh-ed25519) default_private_key='~/.ssh/id_ed25519' ;;
+            ssh-rsa) default_private_key='~/.ssh/id_rsa' ;;
+            ecdsa-*) default_private_key='~/.ssh/id_ecdsa' ;;
+            sk-ssh-ed25519@*) default_private_key='~/.ssh/id_ed25519_sk' ;;
+            sk-ecdsa-*) default_private_key='~/.ssh/id_ecdsa_sk' ;;
+            *) default_private_key='~/.ssh/id_ed25519' ;;
+        esac
+        while true; do
+            printf 'Path to the matching private key on your LOCAL computer [%s]: ' "$default_private_key"
+            IFS= read -r local_private_key || true
+            local_private_key=$(trim_whitespace "$local_private_key")
+            local_private_key=${local_private_key:-$default_private_key}
+            if [[ $local_private_key == *$'\n'* || $local_private_key == *$'\r'* || $local_private_key == -* ]]; then
+                echo "Enter a normal file path that does not start with a dash."
+                continue
+            fi
+            break
+        done
+
         if ask_yes_no "After a successful key test, disable password login for all SSH users?" Y; then
             disable_password=1
         fi
@@ -449,8 +572,10 @@ configure_ssh() {
         return 0
     fi
 
-    current_password=$(sshd -T | awk '$1 == "passwordauthentication" {print $2; exit}')
-    current_kbd=$(sshd -T | awk '$1 == "kbdinteractiveauthentication" {print $2; exit}')
+    # Capture the full output first: early pipeline termination can produce SIGPIPE (141) with pipefail.
+    sshd_effective=$(sshd -T)
+    current_password=$(awk '$1 == "passwordauthentication" && !found {print $2; found=1}' <<<"$sshd_effective")
+    current_kbd=$(awk '$1 == "kbdinteractiveauthentication" && !found {print $2; found=1}' <<<"$sshd_effective")
     current_password=${current_password:-yes}
     current_kbd=${current_kbd:-no}
 
@@ -536,8 +661,9 @@ configure_ssh() {
     echo
     echo "Open a NEW local terminal and test the connection without closing the current session."
     if [[ -n $public_key ]]; then
-        printf '  ssh -o PreferredAuthentications=publickey -o PasswordAuthentication=no -p %s %s@%s\n' \
-            "$desired_port" "$target_user" "$server_address"
+        rendered_private_key=$(format_local_key_path "$local_private_key")
+        printf '  ssh -i %s -o IdentitiesOnly=yes -o PreferredAuthentications=publickey -o PasswordAuthentication=no -p %s %s@%s\n' \
+            "$rendered_private_key" "$desired_port" "$target_user" "$server_address"
     else
         printf '  ssh -p %s %s@%s\n' "$desired_port" "$target_user" "$server_address"
     fi
@@ -665,7 +791,7 @@ configure_fail2ban() {
 
     snapshot_path fail2ban_jail /etc/fail2ban/jail.d/00-setup-sshd.local
     write_file_if_changed /etc/fail2ban/jail.d/00-setup-sshd.local 0644 <<EOF
-# Managed by setup.sh
+# Managed by VPS setup script
 [sshd]
 enabled = true
 backend = systemd
@@ -712,7 +838,7 @@ configure_sysctl() {
 
     snapshot_path sysctl_vpn /etc/sysctl.d/99-vps-vpn-bootstrap.conf
     {
-        echo "# Managed by setup.sh"
+        echo "# Managed by VPS setup script"
         echo "net.ipv4.ip_forward = 1"
         if (( enable_ipv6 )); then echo "net.ipv6.conf.all.forwarding = 1"; fi
         if (( enable_bbr )); then
@@ -739,7 +865,7 @@ configure_journald() {
     fi
 
     write_file_if_changed /etc/systemd/journald.conf.d/90-setup.conf 0644 <<'EOF'
-# Managed by setup.sh
+# Managed by VPS setup script
 [Journal]
 SystemMaxUse=200M
 RuntimeMaxUse=100M
@@ -751,7 +877,8 @@ EOF
 }
 
 swapfile_is_active() {
-    swapon --noheadings --raw --show=NAME 2>/dev/null | grep -qx '/swapfile'
+    swapon --noheadings --raw --show=NAME 2>/dev/null | \
+        awk '$0 == "/swapfile" {found=1} END {exit !found}'
 }
 
 configure_swap() {
@@ -784,8 +911,10 @@ configure_swap() {
 
     [[ ! -e $old_swap ]] || die "Found $old_swap from an incomplete operation. Inspect it manually before running the script again."
     if [[ -e $tmp_swap ]]; then
-        swapon --noheadings --raw --show=NAME 2>/dev/null | grep -qx "$tmp_swap" && \
+        if swapon --noheadings --raw --show=NAME 2>/dev/null | \
+            awk -v path="$tmp_swap" '$0 == path {found=1} END {exit !found}'; then
             die "$tmp_swap is active as swap; manual inspection is required."
+        fi
         rm -f "$tmp_swap"
     fi
 
@@ -804,7 +933,7 @@ configure_swap() {
             return 0
         fi
 
-        swap_used=$(swapon --noheadings --bytes --show=NAME,USED 2>/dev/null | awk '$1=="/swapfile" {print $2; exit}')
+        swap_used=$(swapon --noheadings --bytes --show=NAME,USED 2>/dev/null |             awk '$1 == "/swapfile" && !found {print $2; found=1}')
         swap_used=${swap_used:-0}
         mem_available=$(awk '/MemAvailable:/ {printf "%.0f", $2 * 1024}' /proc/meminfo)
         (( swap_used < mem_available )) || die "There is not enough available RAM to safely disable the current /swapfile."
@@ -908,7 +1037,7 @@ final_checks() {
     ((${#ports[@]})) || ports=("not detected")
 
     if command -v ufw >/dev/null 2>&1; then
-        ufw_state=$(LC_ALL=C ufw status 2>/dev/null | head -n1)
+        ufw_state=$(LC_ALL=C ufw status 2>/dev/null | awk 'NR == 1 {first=$0} END {print first}')
         ufw_state=${ufw_state:-"status unknown"}
     else
         ufw_state="not installed"
@@ -954,6 +1083,7 @@ final_checks() {
     echo "Reboot required:    $reboot_state"
     echo "Log:                $LOG_FILE"
     echo "Backups:            $BACKUP_DIR"
+    echo "tmux session:        $TMUX_SESSION"
 
     if ((${#CHANGES[@]})); then
         echo
@@ -979,7 +1109,8 @@ main() {
     require_root
     [[ -t 0 ]] || die "An interactive terminal is required: save the file and run sudo bash $SCRIPT_NAME"
     check_os
-    echo "Starting $SCRIPT_NAME. Every main step can be skipped."
+    echo "Starting $SCRIPT_NAME version $SCRIPT_VERSION. Every main step can be skipped."
+    echo "tmux session: $TMUX_SESSION (reattach with: tmux attach -t $TMUX_SESSION)"
     echo "Do not close the current SSH session until SSH verification is complete."
 
     configure_system_updates

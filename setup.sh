@@ -20,7 +20,7 @@ SCRIPT_PATH="$(readlink -f -- "$SCRIPT_SOURCE")"
     printf 'ERROR: Unable to resolve the script file: %s\n' "$SCRIPT_SOURCE" >&2
     exit 1
 }
-TMUX_SESSION="vps-setup-v8"
+TMUX_SESSION="vps-setup"
 
 bootstrap_tmux() {
     # Run the interactive setup in tmux

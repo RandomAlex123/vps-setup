@@ -7,29 +7,16 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 027
 
-SCRIPT_VERSION="7.0.0"
-# BASH_SOURCE can be empty or equal to "main" when Bash reads this script from stdin.
-SCRIPT_SOURCE="${BASH_SOURCE[0]-}"
-case "$SCRIPT_SOURCE" in
-    ""|main|stdin|fd|[0-9]*|pipe:*)
-        SCRIPT_SOURCE=""
-        SCRIPT_NAME="setup-v7.sh"
-        SCRIPT_PATH=""
-        ;;
-    *)
-        SCRIPT_NAME="$(basename -- "$SCRIPT_SOURCE")"
-        SCRIPT_PATH="$(readlink -f -- "$SCRIPT_SOURCE" 2>/dev/null || printf '%s' "$SCRIPT_SOURCE")"
-        ;;
-esac
-TMUX_SESSION="vps-setup-v7"
+SCRIPT_VERSION="6.0.0"
+SCRIPT_SOURCE="${BASH_SOURCE[0]}"
+SCRIPT_NAME="$(basename "$SCRIPT_SOURCE")"
+SCRIPT_PATH="$(readlink -f -- "$SCRIPT_SOURCE" 2>/dev/null || printf '%s' "$SCRIPT_SOURCE")"
+TMUX_SESSION="vps-setup-v6"
 BOOTSTRAP_TEMP_SCRIPT=""
-TTY_AVAILABLE=0
-TTY_FD=9
 
-# A pipe is not a TTY, but an interactive SSH session still exposes /dev/tty.
-if [[ -c /dev/tty ]] && { exec 9<>/dev/tty; } 2>/dev/null; then
-    TTY_AVAILABLE=1
-fi
+case "$SCRIPT_NAME" in
+    stdin|fd|[0-9]*|pipe:*) SCRIPT_NAME="setup-v6.sh" ;;
+esac
 
 script_path_is_persistent() {
     [[ -n $SCRIPT_PATH && -f $SCRIPT_PATH && -r $SCRIPT_PATH ]] || return 1
@@ -59,7 +46,7 @@ prepare_script_for_tmux() {
             ;;
     esac
 
-    temp_script=$(mktemp /var/tmp/setup-v7.XXXXXX.sh)
+    temp_script=$(mktemp /var/tmp/setup-v6.XXXXXX.sh)
     if ! curl -fsSL "$SETUP_SOURCE_URL" -o "$temp_script"; then
         rm -f -- "$temp_script"
         printf 'ERROR: Unable to download a persistent script copy for tmux.\n' >&2
@@ -86,8 +73,8 @@ bootstrap_tmux() {
         printf 'ERROR: Run this script as root: sudo bash %s\n' "$SCRIPT_NAME" >&2
         exit 1
     }
-    (( TTY_AVAILABLE )) || {
-        printf 'WARNING: No controlling terminal is available; continuing without tmux.\n'
+    [[ -t 1 && -r /dev/tty ]] || {
+        printf 'WARNING: No interactive terminal detected; continuing without tmux.\n'
         return 0
     }
 
@@ -118,7 +105,7 @@ bootstrap_tmux() {
 
     if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
         printf 'Attaching to the existing tmux session: %s\n' "$TMUX_SESSION"
-        exec tmux attach-session -t "$TMUX_SESSION" <&$TTY_FD >&$TTY_FD 2>&$TTY_FD
+        exec tmux attach-session -t "$TMUX_SESSION" </dev/tty
     fi
 
     prepare_script_for_tmux || return 0
@@ -142,7 +129,7 @@ bootstrap_tmux() {
         printf 'ERROR: Unable to create tmux session %s.\n' "$TMUX_SESSION" >&2
         exit 1
     fi
-    exec tmux attach-session -t "$TMUX_SESSION" <&$TTY_FD >&$TTY_FD 2>&$TTY_FD
+    exec tmux attach-session -t "$TMUX_SESSION" </dev/tty
 }
 
 bootstrap_tmux "$@"
@@ -193,7 +180,7 @@ on_error() {
 trap 'on_error "$LINENO"' ERR
 cleanup() {
     rm -rf -- "$RUNTIME_DIR"
-    if [[ -n ${SETUP_TEMP_SCRIPT_PATH:-} && $SETUP_TEMP_SCRIPT_PATH == /var/tmp/setup-v7.*.sh ]]; then
+    if [[ -n ${SETUP_TEMP_SCRIPT_PATH:-} && $SETUP_TEMP_SCRIPT_PATH == /var/tmp/setup-v6.*.sh ]]; then
         rm -f -- "$SETUP_TEMP_SCRIPT_PATH"
     fi
 }
@@ -252,8 +239,8 @@ trim_whitespace() {
 
 read_tty() {
     local variable_name=$1
-    if (( TTY_AVAILABLE )); then
-        IFS= read -r "$variable_name" <&$TTY_FD
+    if [[ -r /dev/tty ]]; then
+        IFS= read -r "$variable_name" </dev/tty
     else
         IFS= read -r "$variable_name"
     fi
@@ -1253,7 +1240,7 @@ final_checks() {
 
 main() {
     require_root
-    (( TTY_AVAILABLE )) || [[ -t 0 ]] || die "An interactive terminal is required."
+    [[ -t 0 || -r /dev/tty ]] || die "An interactive terminal is required."
     check_os
     echo "Starting $SCRIPT_NAME version $SCRIPT_VERSION. Every main step can be skipped."
     echo "tmux session: $TMUX_SESSION (reattach with: tmux attach -t $TMUX_SESSION)"

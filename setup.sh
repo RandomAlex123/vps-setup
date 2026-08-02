@@ -1,14 +1,69 @@
 #!/usr/bin/env bash
 # Safe baseline VPS preparation for VPN panels on Ubuntu and Debian.
 
+vps_setup_entrypoint() {
+
 set -Eeuo pipefail
 IFS=$'\n\t'
 umask 027
 
-SCRIPT_VERSION="5.0.0"
-SCRIPT_NAME="$(basename "$0")"
-SCRIPT_PATH="$(readlink -f "$0")"
-TMUX_SESSION="vps-setup"
+SCRIPT_VERSION="6.0.0"
+SCRIPT_SOURCE="${BASH_SOURCE[0]}"
+SCRIPT_NAME="$(basename "$SCRIPT_SOURCE")"
+SCRIPT_PATH="$(readlink -f -- "$SCRIPT_SOURCE" 2>/dev/null || printf '%s' "$SCRIPT_SOURCE")"
+TMUX_SESSION="vps-setup-v6"
+BOOTSTRAP_TEMP_SCRIPT=""
+
+case "$SCRIPT_NAME" in
+    stdin|fd|[0-9]*|pipe:*) SCRIPT_NAME="setup-v6.sh" ;;
+esac
+
+script_path_is_persistent() {
+    [[ -n $SCRIPT_PATH && -f $SCRIPT_PATH && -r $SCRIPT_PATH ]] || return 1
+    case "$SCRIPT_PATH" in
+        /dev/fd/*|/dev/stdin|/proc/*/fd/*|*'pipe:['*) return 1 ;;
+    esac
+    return 0
+}
+
+prepare_script_for_tmux() {
+    local temp_script
+
+    script_path_is_persistent && return 0
+
+    if [[ -z ${SETUP_SOURCE_URL:-} ]]; then
+        printf '%s\n' \
+            'WARNING: The script was started from an ephemeral pipe or file descriptor.' \
+            'tmux continuation requires SETUP_SOURCE_URL; continuing without tmux.' >&2
+        return 1
+    fi
+
+    case "$SETUP_SOURCE_URL" in
+        https://*) ;;
+        *)
+            printf 'ERROR: SETUP_SOURCE_URL must use HTTPS.\n' >&2
+            exit 1
+            ;;
+    esac
+
+    temp_script=$(mktemp /var/tmp/setup-v6.XXXXXX.sh)
+    if ! curl -fsSL "$SETUP_SOURCE_URL" -o "$temp_script"; then
+        rm -f -- "$temp_script"
+        printf 'ERROR: Unable to download a persistent script copy for tmux.\n' >&2
+        exit 1
+    fi
+    chmod 0700 "$temp_script"
+    if ! bash -n "$temp_script"; then
+        rm -f -- "$temp_script"
+        printf 'ERROR: The downloaded script copy failed the Bash syntax check.\n' >&2
+        exit 1
+    fi
+
+    SCRIPT_PATH=$temp_script
+    BOOTSTRAP_TEMP_SCRIPT=$temp_script
+    printf 'Saved a temporary script copy for tmux: %s\n' "$temp_script"
+}
+
 
 bootstrap_tmux() {
     # Run the interactive setup in tmux
@@ -18,7 +73,7 @@ bootstrap_tmux() {
         printf 'ERROR: Run this script as root: sudo bash %s\n' "$SCRIPT_NAME" >&2
         exit 1
     }
-    [[ -t 0 && -t 1 ]] || {
+    [[ -t 1 && -r /dev/tty ]] || {
         printf 'WARNING: No interactive terminal detected; continuing without tmux.\n'
         return 0
     }
@@ -50,24 +105,31 @@ bootstrap_tmux() {
 
     if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
         printf 'Attaching to the existing tmux session: %s\n' "$TMUX_SESSION"
-        exec tmux attach-session -t "$TMUX_SESSION"
+        exec tmux attach-session -t "$TMUX_SESSION" </dev/tty
     fi
 
-    local quoted_script quoted_args='' quoted_arg arg tmux_command
+    prepare_script_for_tmux || return 0
+
+    local quoted_script quoted_temp quoted_args='' quoted_arg arg tmux_command
     printf -v quoted_script '%q' "$SCRIPT_PATH"
+    printf -v quoted_temp '%q' "$BOOTSTRAP_TEMP_SCRIPT"
     for arg in "$@"; do
         printf -v quoted_arg '%q' "$arg"
         quoted_args+=" $quoted_arg"
     done
 
     printf -v tmux_command \
-        'env SETUP_TMUX_REEXEC=1 bash %s%s; rc=$?; printf "\\nSetup script finished with exit code %%s.\\n" "$rc"; printf "Press Enter to close this tmux session... "; read -r; exit "$rc"' \
-        "$quoted_script" "$quoted_args"
+        'env SETUP_TMUX_REEXEC=1 SETUP_TEMP_SCRIPT_PATH=%s bash %s%s; rc=$?; printf "\\nSetup script finished with exit code %%s.\\n" "$rc"; printf "Press Enter to close this tmux session... "; read -r; exit "$rc"' \
+        "$quoted_temp" "$quoted_script" "$quoted_args"
 
     printf 'Starting setup version %s inside tmux session: %s\n' "$SCRIPT_VERSION" "$TMUX_SESSION"
     printf 'If SSH disconnects, reconnect and run: tmux attach -t %s\n' "$TMUX_SESSION"
-    tmux new-session -d -s "$TMUX_SESSION" "$tmux_command"
-    exec tmux attach-session -t "$TMUX_SESSION"
+    if ! tmux new-session -d -s "$TMUX_SESSION" "$tmux_command"; then
+        [[ -n $BOOTSTRAP_TEMP_SCRIPT ]] && rm -f -- "$BOOTSTRAP_TEMP_SCRIPT"
+        printf 'ERROR: Unable to create tmux session %s.\n' "$TMUX_SESSION" >&2
+        exit 1
+    fi
+    exec tmux attach-session -t "$TMUX_SESSION" </dev/tty
 }
 
 bootstrap_tmux "$@"
@@ -116,7 +178,12 @@ on_error() {
     exit "$rc"
 }
 trap 'on_error "$LINENO"' ERR
-cleanup() { rm -rf -- "$RUNTIME_DIR"; }
+cleanup() {
+    rm -rf -- "$RUNTIME_DIR"
+    if [[ -n ${SETUP_TEMP_SCRIPT_PATH:-} && $SETUP_TEMP_SCRIPT_PATH == /var/tmp/setup-v6.*.sh ]]; then
+        rm -f -- "$SETUP_TEMP_SCRIPT_PATH"
+    fi
+}
 trap cleanup EXIT
 
 require_root() {
@@ -170,13 +237,22 @@ trim_whitespace() {
     printf '%s' "$value"
 }
 
+read_tty() {
+    local variable_name=$1
+    if [[ -r /dev/tty ]]; then
+        IFS= read -r "$variable_name" </dev/tty
+    else
+        IFS= read -r "$variable_name"
+    fi
+}
+
 ask_yes_no() {
     local question=$1 default=${2:-N} answer prompt
     default=${default^^}
     if [[ $default == Y ]]; then prompt='[Y/n]'; else prompt='[y/N]'; fi
     while true; do
         printf '%s %s ' "$question" "$prompt"
-        if ! IFS= read -r answer; then answer=""; fi
+        if ! read_tty answer; then answer=""; fi
         answer=$(trim_whitespace "$answer")
         answer=${answer:-$default}
         case ${answer,,} in
@@ -499,7 +575,7 @@ configure_ssh() {
     default_user=${SUDO_USER:-${USER:-root}}
     [[ $default_user == root || $default_user != "" ]] || default_user=root
     printf 'User for the SSH key [%s]: ' "$default_user"
-    IFS= read -r target_user || true
+    read_tty target_user || true
     target_user=${target_user:-$default_user}
     getent passwd "$target_user" >/dev/null || die "User '$target_user' does not exist."
     user_home=$(getent passwd "$target_user" | cut -d: -f6)
@@ -510,7 +586,7 @@ configure_ssh() {
     if ask_yes_no "Add a public SSH key for '$target_user'?" Y; then
         while true; do
             echo "Paste one public key line (ssh-ed25519/ssh-rsa/ecdsa/...):"
-            IFS= read -r public_key || true
+            read_tty public_key || true
             [[ -n $public_key ]] || { echo "The key cannot be empty."; continue; }
             key_tmp=$(mktemp "$RUNTIME_DIR/pubkey.XXXXXX")
             printf '%s\n' "$public_key" > "$key_tmp"
@@ -533,7 +609,7 @@ configure_ssh() {
         esac
         while true; do
             printf 'Path to the matching private key on your LOCAL computer [%s]: ' "$default_private_key"
-            IFS= read -r local_private_key || true
+            read_tty local_private_key || true
             local_private_key=$(trim_whitespace "$local_private_key")
             local_private_key=${local_private_key:-$default_private_key}
             if [[ $local_private_key == *$'\n'* || $local_private_key == *$'\r'* || $local_private_key == -* ]]; then
@@ -552,7 +628,7 @@ configure_ssh() {
         change_port=1
         while true; do
             printf 'New SSH port [for example 2222]: '
-            IFS= read -r desired_port || true
+            read_tty desired_port || true
             if ! valid_port "$desired_port"; then
                 echo "The port must be an integer from 1 to 65535."
                 continue
@@ -669,7 +745,7 @@ configure_ssh() {
     fi
     echo "The current SSH session and old port are still available."
     printf "After a SUCCESSFUL login, enter exactly YES; any other answer will roll back the SSH changes: "
-    IFS= read -r confirm || true
+    read_tty confirm || true
 
     if [[ $confirm != YES ]]; then
         rollback_ssh
@@ -949,7 +1025,7 @@ configure_swap() {
     print_swap_summary
     while true; do
         printf 'Additional /swapfile size in MB [press Enter to keep the current configuration]: '
-        IFS= read -r size_mb || true
+        read_tty size_mb || true
         [[ -z $size_mb ]] && { log "Swap size left unchanged."; return 0; }
         if [[ $size_mb =~ ^[0-9]+$ ]] && (( size_mb >= 128 && size_mb <= 131072 )); then
             break
@@ -1164,7 +1240,7 @@ final_checks() {
 
 main() {
     require_root
-    [[ -t 0 ]] || die "An interactive terminal is required: save the file and run sudo bash $SCRIPT_NAME"
+    [[ -t 0 || -r /dev/tty ]] || die "An interactive terminal is required."
     check_os
     echo "Starting $SCRIPT_NAME version $SCRIPT_VERSION. Every main step can be skipped."
     echo "tmux session: $TMUX_SESSION (reattach with: tmux attach -t $TMUX_SESSION)"
@@ -1182,6 +1258,7 @@ main() {
     final_checks
 }
 
-if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
-    main "$@"
-fi
+main "$@"
+}
+
+vps_setup_entrypoint "$@"

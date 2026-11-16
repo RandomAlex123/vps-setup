@@ -106,6 +106,10 @@ APT_UPDATED=0
 SSH_FINAL_PORTS=()
 SSH_CHANGES_START=0
 UFW_RULE_MODE="not configured by this run"
+SSH_CHANGE_PORT=0
+SSH_CONFIG_ENDPOINTS=()
+SSH_SOCKET_ENDPOINTS=()
+SSH_PENDING_PORTS=()
 
 log()  { printf '[%s] %s\n' "$(date '+%F %T')" "$*"; }
 info() { printf '\n==> %s\n' "$*"; }
@@ -340,7 +344,11 @@ EOF
 
 get_configured_ssh_ports() {
     if command -v sshd >/dev/null 2>&1; then
-        sshd -T 2>/dev/null | awk '$1 == "port" {print $2}' || true
+        sshd -T 2>/dev/null | awk '
+            $1 == "port" {ports[++n] = $2}
+            $1 == "listenaddress" {endpoint=$2; sub(/^.*:/, "", endpoint); print endpoint; found=1}
+            END {if (!found) for (i=1; i<=n; i++) print ports[i]}
+        ' || true
     fi
 }
 
@@ -367,9 +375,22 @@ port_is_listening() {
 }
 
 port_speaks_ssh() {
-    local port=$1
-    ssh-keyscan -T 3 -p "$port" 127.0.0.1 2>/dev/null | \
-        awk '/^[^#].+[[:space:]](ssh-|ecdsa-)/ {found=1} END {exit !found}'
+    local port=$1 address endpoint
+    local -a addresses=()
+    mapfile -t addresses < <(ss -H -ltn "sport = :$port" | awk '{print $4}' | sort -u)
+    for endpoint in "${addresses[@]}"; do
+        address=${endpoint%:*}
+        address=${address#\[}; address=${address%\]}
+        case $address in
+            '*'|0.0.0.0) address=127.0.0.1 ;;
+            ::) address=::1 ;;
+        esac
+        if ssh-keyscan -T 3 -p "$port" "$address" 2>/dev/null | \
+            awk '/^[^#].+[[:space:]](ssh-|ecdsa-)/ {found=1} END {exit !found}'; then
+            return 0
+        fi
+    done
+    return 1
 }
 
 wait_for_ssh() {
@@ -403,6 +424,89 @@ assert_effective_ssh_ports() {
     [[ $actual == "$expected" ]]
 }
 
+validate_ssh_endpoint() {
+    local endpoint=$1 address port
+    [[ $endpoint == *:* ]] || return 1
+    address=${endpoint%:*}; port=${endpoint##*:}
+    valid_port "$port" || return 1
+    # sshd -T and systemd must supply concrete IP endpoints, not Unix sockets.
+    [[ $address =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ || $address =~ ^\[[0-9a-fA-F:.%a-zA-Z_-]+\]$ ]]
+}
+
+read_ssh_config_endpoints() {
+    local config=$1 keyword endpoint rest
+    SSH_CONFIG_ENDPOINTS=()
+    while IFS=$' \t' read -r keyword endpoint rest; do
+        [[ $keyword == listenaddress ]] || continue
+        [[ -z $rest ]] || return 1
+        validate_ssh_endpoint "$endpoint" || return 1
+        SSH_CONFIG_ENDPOINTS+=("$endpoint")
+    done <<<"$config"
+    ((${#SSH_CONFIG_ENDPOINTS[@]}))
+}
+
+read_ssh_socket_endpoints() {
+    local value endpoint kind
+    local -a words=()
+    SSH_SOCKET_ENDPOINTS=()
+    value=$(systemctl show ssh.socket --property=Listen --value) || return 1
+    # The property consists of endpoint/type pairs, possibly on one line.
+    value=${value//$'\n'/ }
+    IFS=$' \t' read -r -a words <<<"$value"
+    ((${#words[@]} && ${#words[@]} % 2 == 0)) || return 1
+    while ((${#words[@]})); do
+        endpoint=${words[0]}; kind=${words[1]}
+        [[ $kind == '(Stream)' ]] && validate_ssh_endpoint "$endpoint" || return 1
+        SSH_SOCKET_ENDPOINTS+=("$endpoint")
+        words=("${words[@]:2}")
+    done
+}
+
+capture_ssh_listener_state() {
+    local effective
+    effective=$(sshd -T) || return 1
+    read_ssh_config_endpoints "$effective" || return 1
+    SSH_SOCKET_MODE=0
+    # Enabled-but-stopped sockets are not the current administrative endpoint.
+    if systemctl is-active --quiet ssh.socket; then
+        SSH_SOCKET_MODE=1
+        read_ssh_socket_endpoints || return 1
+        SSH_CONFIG_ENDPOINTS=("${SSH_SOCKET_ENDPOINTS[@]}")
+    fi
+}
+
+ssh_endpoints_for_ports() {
+    local -n original_endpoints=$1
+    shift
+    local endpoint port
+    for port in "$@"; do
+        for endpoint in "${original_endpoints[@]}"; do
+            if (( SSH_CHANGE_PORT )) && [[ $port == "$SSH_NEW_PORT" ]]; then
+                printf '%s:%s\n' "${endpoint%:*}" "$port"
+            elif [[ ${endpoint##*:} == "$port" ]]; then
+                printf '%s\n' "$endpoint"
+            fi
+        done
+    done | sort -u
+}
+
+assert_effective_ssh_endpoints() {
+    local expected actual config
+    local -a original=("${SSH_CONFIG_ENDPOINTS[@]}")
+    expected=$(ssh_endpoints_for_ports original "$@")
+    config=$(sshd -T) || return 1
+    # Parse in a subshell so that the original snapshot remains unchanged.
+    actual=$(read_ssh_config_endpoints "$config" && printf '%s\n' "${SSH_CONFIG_ENDPOINTS[@]}" | sort -u) || return 1
+    [[ -n $expected && $actual == "$expected" ]]
+}
+
+assert_effective_ssh_socket_endpoints() {
+    local expected actual
+    expected=$(ssh_endpoints_for_ports SSH_SOCKET_ENDPOINTS "${SSH_PENDING_PORTS[@]}")
+    actual=$(read_ssh_socket_endpoints && printf '%s\n' "${SSH_SOCKET_ENDPOINTS[@]}" | sort -u) || return 1
+    [[ -n $expected && $actual == "$expected" ]]
+}
+
 neutralize_existing_ssh_listeners() {
     local file tmp mode owner group
     local -a files=(/etc/ssh/sshd_config)
@@ -432,6 +536,9 @@ reload_ssh() {
     local service
     systemctl daemon-reload
     if (( SSH_SOCKET_MODE )); then
+        if (( SSH_CHANGE_PORT )); then
+            assert_effective_ssh_socket_endpoints || return 1
+        fi
         systemctl restart ssh.socket
     else
         service=$(ssh_service_name) || return 1
@@ -458,6 +565,7 @@ rollback_ssh() {
     if (( SSH_UFW_RULE_ADDED )) && [[ -n $SSH_NEW_PORT ]] && command -v ufw >/dev/null 2>&1; then
         ufw --force delete allow "${SSH_NEW_PORT}/tcp" >/dev/null 2>&1 || true
     fi
+    SSH_CHANGE_PORT=0
     reload_ssh >/dev/null 2>&1 || true
     SSH_TX_ACTIVE=0
     SSH_FINAL_PORTS=()
@@ -506,11 +614,13 @@ KEY_SCRIPT
 }
 
 make_ssh_dropin() {
-    local password_auth=$1 kbd_auth=$2
+    local password_auth=$1 kbd_auth=$2 p endpoint
     shift 2
     {
         echo "# Managed by VPS setup script"
         for p in "$@"; do echo "Port $p"; done
+        while IFS= read -r endpoint; do echo "ListenAddress $endpoint"; done \
+            < <(ssh_endpoints_for_ports SSH_CONFIG_ENDPOINTS "$@")
         echo "PubkeyAuthentication yes"
         echo "PasswordAuthentication $password_auth"
         echo "KbdInteractiveAuthentication $kbd_auth"
@@ -518,13 +628,15 @@ make_ssh_dropin() {
 }
 
 make_ssh_socket_dropin() {
-    local p
-    (( SSH_SOCKET_MODE )) || return 0
+    local endpoint
+    (( SSH_SOCKET_MODE && SSH_CHANGE_PORT )) || return 0
+    SSH_PENDING_PORTS=("$@")
     {
         echo "# Managed by VPS setup script"
         echo "[Socket]"
         echo "ListenStream="
-        for p in "$@"; do echo "ListenStream=$p"; done
+        while IFS= read -r endpoint; do echo "ListenStream=$endpoint"; done \
+            < <(ssh_endpoints_for_ports SSH_SOCKET_ENDPOINTS "$@")
     } | write_file_if_changed /etc/systemd/system/ssh.socket.d/00-setup.conf 0644
 }
 
@@ -545,7 +657,12 @@ configure_ssh() {
     command -v sshd >/dev/null 2>&1 || die "The sshd command was not found."
     sshd -t
 
-    mapfile -t old_ports < <(get_safe_ssh_ports | sort -nu)
+    capture_ssh_listener_state || die "Unsupported active SSH listener configuration; no SSH changes were made."
+    if (( SSH_SOCKET_MODE )); then
+        mapfile -t old_ports < <(printf '%s\n' "${SSH_SOCKET_ENDPOINTS[@]}" | sed 's/.*://' | sort -nu)
+    else
+        mapfile -t old_ports < <(get_safe_ssh_ports | sort -nu)
+    fi
     ((${#old_ports[@]})) || old_ports=(22)
     primary_port=${old_ports[0]}
 
@@ -630,11 +747,7 @@ configure_ssh() {
     current_password=${current_password:-yes}
     current_kbd=${current_kbd:-no}
 
-    SSH_SOCKET_MODE=0
-    if systemctl is-active --quiet ssh.socket 2>/dev/null || systemctl is-enabled --quiet ssh.socket >/dev/null 2>&1; then
-        SSH_SOCKET_MODE=1
-    fi
-
+    SSH_CHANGE_PORT=$change_port
     SSH_NEW_PORT=$desired_port
     SSH_UFW_RULE_ADDED=0
     SSH_CHANGES_START=${#CHANGES[@]}
@@ -660,9 +773,8 @@ configure_ssh() {
         CHANGES+=("Installed SSH key for $target_user (retained on SSH configuration rollback)")
     fi
 
-    if (( change_port )); then
-        neutralize_existing_ssh_listeners
-    fi
+    # Consolidate listeners while retaining their captured address/port scope.
+    neutralize_existing_ssh_listeners
 
     staged_ports=("${old_ports[@]}")
     if ! array_contains "$desired_port" "${staged_ports[@]}"; then
@@ -681,6 +793,10 @@ configure_ssh() {
     if ! sshd -t; then
         rollback_ssh
         die "The new SSH configuration failed validation."
+    fi
+    if ! assert_effective_ssh_endpoints "${staged_ports[@]}"; then
+        rollback_ssh
+        die "SSH listener addresses or ports changed unexpectedly; changes were rolled back."
     fi
     if (( change_port )) && ! assert_effective_ssh_ports "${staged_ports[@]}"; then
         rollback_ssh
@@ -734,6 +850,10 @@ configure_ssh() {
     make_ssh_socket_dropin "${final_ports[@]}"
 
     sshd -t
+    if ! assert_effective_ssh_endpoints "${final_ports[@]}"; then
+        rollback_ssh
+        die "Final SSH listener addresses or ports differ from the requested endpoints; changes were rolled back."
+    fi
     if (( change_port )) && ! assert_effective_ssh_ports "${final_ports[@]}"; then
         rollback_ssh
         die "Unable to keep only the new SSH port; changes were rolled back."

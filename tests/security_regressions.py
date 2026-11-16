@@ -23,6 +23,8 @@ def helper(name):
 
 
 def bash(script, *args, check=True):
+    if os.environ.get("TEST_BASH_TRACE"):
+        script = "set -x\n" + script
     env = os.environ.copy()
     # MSYS otherwise silently copies files instead of creating real symlinks.
     env["MSYS"] = (env.get("MSYS", "") + " winsymlinks:nativestrict").strip()
@@ -92,6 +94,88 @@ if add_user_ssh_key test-user "$work/home" BAD; then exit 92; fi
     def test_root_rollback_does_not_restore_user_home(self):
         self.assertNotIn("ssh_user_dir", SOURCE)
         self.assertNotIn('chown "$user_uid:$user_gid"', SOURCE)
+
+
+class ListenerTests(unittest.TestCase):
+    def endpoint_helpers(self):
+        return "\n".join(helper(n) for n in (
+            "valid_port", "validate_ssh_endpoint", "read_ssh_config_endpoints",
+            "read_ssh_socket_endpoints", "ssh_endpoints_for_ports",
+            "assert_effective_ssh_endpoints", "assert_effective_ssh_socket_endpoints",
+            "make_ssh_socket_dropin", "capture_ssh_listener_state",
+        ))
+
+    def test_ipv4_ipv6_and_distinct_port_scopes(self):
+        bash(self.endpoint_helpers() + r'''
+set -euo pipefail
+read_ssh_config_endpoints $'port 22\nlistenaddress 10.0.0.5:22\nlistenaddress [fd00::5]:2222'
+SSH_CHANGE_PORT=1 SSH_NEW_PORT=3333
+actual=$(ssh_endpoints_for_ports SSH_CONFIG_ENDPOINTS 22 2222 3333)
+expected=$(printf '%s\n' '10.0.0.5:22' '10.0.0.5:3333' '[fd00::5]:2222' '[fd00::5]:3333' | sort -u)
+[[ $actual == "$expected" ]]
+SSH_CHANGE_PORT=0
+actual=$(ssh_endpoints_for_ports SSH_CONFIG_ENDPOINTS 22 2222)
+expected=$(printf '%s\n' '10.0.0.5:22' '[fd00::5]:2222' | sort -u)
+[[ $actual == "$expected" ]]
+SSH_CHANGE_PORT=1
+sshd() { printf 'listenaddress 0.0.0.0:3333\n'; }
+if assert_effective_ssh_endpoints 3333; then exit 21; fi
+sshd() { printf 'listenaddress 10.0.0.5:3333\nlistenaddress [fd00::5]:3333\n'; }
+assert_effective_ssh_endpoints 3333
+''')
+
+    def test_socket_scope_and_key_only_no_rewrite(self):
+        bash(self.endpoint_helpers() + r'''
+set -euo pipefail
+systemctl() { printf '%s\n' "$SOCKETS"; }
+SOCKETS='127.0.0.1:22 (Stream) [::1]:2222 (Stream)'
+read_ssh_socket_endpoints
+SSH_SOCKET_MODE=1 SSH_CHANGE_PORT=0
+write_file_if_changed() { echo unexpected-write >&2; return 99; }
+make_ssh_socket_dropin 22 2222
+SSH_CHANGE_PORT=1 SSH_NEW_PORT=3333
+write_file_if_changed() { cat; }
+config=$(make_ssh_socket_dropin 22 2222 3333)
+[[ $config == *'ListenStream=127.0.0.1:3333'* ]]
+[[ $config == *'ListenStream=[::1]:3333'* ]]
+[[ $config != *'ListenStream=3333'* ]]
+SSH_PENDING_PORTS=(3333)
+SOCKETS='127.0.0.1:3333 (Stream) [::1]:3333 (Stream)'
+assert_effective_ssh_socket_endpoints
+SOCKETS='0.0.0.0:3333 (Stream)'
+if assert_effective_ssh_socket_endpoints; then exit 22; fi
+SOCKETS='/run/custom.sock (Stream)'
+if read_ssh_socket_endpoints; then exit 23; fi
+SOCKETS='127.0.0.1:3333 (Datagram)'
+if read_ssh_socket_endpoints; then exit 24; fi
+''')
+
+    def test_private_bind_health_probe(self):
+        bash(helper("port_speaks_ssh") + r'''
+set -euo pipefail
+ss() { echo 'LISTEN 0 128 10.0.0.5:2222 0.0.0.0:*'; }
+ssh-keyscan() {
+    [[ ${@: -1} == 10.0.0.5 ]] || return 81
+    echo '10.0.0.5 ssh-ed25519 AAAA'
+}
+port_speaks_ssh 2222
+''')
+
+    def test_enabled_but_inactive_socket_cannot_replace_service_scope(self):
+        bash(self.endpoint_helpers() + r'''
+set -euo pipefail
+sshd() { echo 'listenaddress 127.0.0.1:22'; }
+systemctl() {
+    case $1 in
+        is-active) return 1 ;;
+        is-enabled) return 0 ;;
+        *) echo 'Dormant socket must not be read or activated' >&2; return 91 ;;
+    esac
+}
+capture_ssh_listener_state
+[[ $SSH_SOCKET_MODE == 0 ]]
+[[ ${SSH_CONFIG_ENDPOINTS[0]} == 127.0.0.1:22 ]]
+''')
 
 
 class FirewallTests(unittest.TestCase):

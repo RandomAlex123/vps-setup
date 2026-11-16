@@ -4,6 +4,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -38,6 +39,35 @@ def bash(script, *args, check=True):
 
 
 class KeyBoundaryTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix" and hasattr(os, "geteuid") and os.geteuid() == 0,
+                         "Real runuser boundary requires Linux root in a disposable environment")
+    def test_real_unprivileged_user_cannot_modify_root_file(self):
+        import pwd
+        try:
+            account = pwd.getpwnam("nobody")
+        except KeyError:
+            self.skipTest("No existing nobody account")
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            work.chmod(0o755)
+            home = work / "home"
+            home.mkdir()
+            os.chown(home, account.pw_uid, account.pw_gid)
+            home.chmod(0o700)
+            script = helper("add_user_ssh_key") + '\nRUN_ID=test\nadd_user_ssh_key "$1" "$2" "$3"\n'
+            bash(script, account.pw_name, home, "ssh-ed25519 NEW")
+            key = home / ".ssh" / "authorized_keys"
+            self.assertEqual(key.stat().st_uid, account.pw_uid)
+            sentinel = work / "root-file"
+            sentinel.write_text("sentinel")
+            sentinel.chmod(0o600)
+            key.unlink()
+            key.symlink_to(sentinel)
+            result = bash(script, account.pw_name, home, "BAD", check=False)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(sentinel.stat().st_uid, 0)
+            self.assertEqual(sentinel.read_text(), "sentinel")
+
     def key_script(self):
         # runuser is replaced only to run the unprivileged body as this test user.
         # Assert its exact argument boundary before passing the body to Bash.
@@ -96,6 +126,135 @@ if add_user_ssh_key test-user "$work/home" BAD; then exit 92; fi
         self.assertNotIn('chown "$user_uid:$user_gid"', SOURCE)
 
 
+class AuthenticationTests(unittest.TestCase):
+    def audit_config(self, files):
+        source = helper("check_ssh_password_overrides")
+        program = source.split("<<'POLICY_PY'\n", 1)[1].split("\nPOLICY_PY", 1)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, content in files.items():
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content, encoding="utf-8")
+            return subprocess.run(
+                [sys.executable, "-c", program, str(root / "sshd_config"), str(root)],
+                capture_output=True, text=True,
+            )
+
+    def test_nested_match_password_and_keyboard_overrides_rejected(self):
+        for directive in ("PasswordAuthentication yes", "KbdInteractiveAuthentication yes",
+                          "ChallengeResponseAuthentication yes", "PasswordAuthentication=yes"):
+            with self.subTest(directive=directive):
+                result = self.audit_config({
+                    "sshd_config": 'Include "parts/*.conf"\n',
+                    "parts/10.conf": 'mAtCh User other\nInclude nested.conf\n',
+                    "nested.conf": directive + "\n",
+                })
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Conditional password", result.stderr)
+
+    def test_global_old_values_and_safe_match_are_allowed(self):
+        result = self.audit_config({
+            "sshd_config": 'PasswordAuthentication yes\nInclude=parts/*.conf\n',
+            "parts/10.conf": 'Match User sftp\nForceCommand internal-sftp\nPasswordAuthentication no\n',
+        })
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_include_cycle_and_unsupported_expansion_fail_closed(self):
+        for content in ("Include sshd_config\n", "Include %u.conf\n", 'Include "unterminated\n',
+                        'Include "parts/back\\slash.conf"\n'):
+            with self.subTest(content=content):
+                self.assertNotEqual(self.audit_config({"sshd_config": content}).returncode, 0)
+
+    def test_effective_policy_is_required(self):
+        bash(helper("assert_password_auth_disabled") + r'''
+set -euo pipefail
+sshd() { printf '%s\n' "$POLICY"; }
+check_ssh_password_overrides() { [[ $SCANNER_OK == 1 ]]; }
+SCANNER_OK=1
+POLICY=$'pubkeyauthentication yes\npasswordauthentication no\nkbdinteractiveauthentication no'
+assert_password_auth_disabled
+for POLICY in \
+    $'pubkeyauthentication yes\npasswordauthentication yes\nkbdinteractiveauthentication no' \
+    $'pubkeyauthentication yes\npasswordauthentication no\nkbdinteractiveauthentication yes' \
+    $'pubkeyauthentication no\npasswordauthentication no\nkbdinteractiveauthentication no'; do
+    if assert_password_auth_disabled; then exit 31; fi
+done
+POLICY=$'pubkeyauthentication yes\npasswordauthentication no\nkbdinteractiveauthentication no'
+SCANNER_OK=0
+if assert_password_auth_disabled; then exit 32; fi
+''')
+
+    def test_socket_mode_restarts_master_without_losing_activation_fds(self):
+        bash(helper("assert_ssh_service_preserves_sessions") + '\n' + helper("reload_ssh") + r'''
+set -euo pipefail
+work=$(mktemp -d)
+trap 'rm -rf -- "$work"' EXIT
+TRACE="$work/trace"
+ssh_service_name() { echo ssh.service; }
+assert_effective_ssh_socket_endpoints() { return 0; }
+systemctl() {
+    printf '%s\n' "$*" >> "$TRACE"
+    case $1 in
+        show) echo "$KILL_MODE" ;;
+        is-active) [[ $ACTIVE == 1 ]] ;;
+        stop|restart|start) [[ $* != "$FAIL_COMMAND" ]] ;;
+    esac
+}
+KILL_MODE=process ACTIVE=1 FAIL_COMMAND=''
+SSH_SOCKET_MODE=1 SSH_CHANGE_PORT=0
+reload_ssh
+grep -q '^stop ssh.socket ssh.service$' "$TRACE"
+grep -q '^start ssh.socket$' "$TRACE"
+grep -q '^start ssh.service$' "$TRACE"
+! grep -q '^reload ssh.service$' "$TRACE"
+: > "$TRACE"
+SSH_CHANGE_PORT=1
+reload_ssh
+[[ $(grep -E '^(stop|restart|start) ' "$TRACE") == $'stop ssh.socket ssh.service\nstart ssh.socket\nstart ssh.service' ]]
+: > "$TRACE"
+SSH_CHANGE_PORT=0
+reload_ssh restore
+grep -q '^start ssh.socket$' "$TRACE"
+ACTIVE=0
+: > "$TRACE"
+reload_ssh
+! grep -q '^start ssh.service$' "$TRACE"
+SSH_SOCKET_SERVICE_WAS_ACTIVE=1
+reload_ssh restore
+grep -q '^start ssh.service$' "$TRACE"
+SSH_SOCKET_SERVICE_WAS_ACTIVE=0 ACTIVE=1
+: > "$TRACE"
+reload_ssh restore
+grep -q '^stop ssh.socket ssh.service$' "$TRACE"
+! grep -q '^start ssh.service$' "$TRACE"
+ACTIVE=1 SSH_CHANGE_PORT=1
+for FAIL_COMMAND in 'stop ssh.socket ssh.service' 'start ssh.socket' 'start ssh.service'; do
+    if reload_ssh; then exit 41; fi
+done
+FAIL_COMMAND='' KILL_MODE=control-group
+: > "$TRACE"
+if reload_ssh; then exit 42; fi
+! grep -qE '^(stop|restart|start) ' "$TRACE"
+''')
+
+    def test_global_policy_precedes_old_settings_and_is_idempotent(self):
+        bash(helper("set_ssh_global_key_only") + r'''
+set -euo pipefail
+work=$(mktemp -d)
+trap 'rm -rf -- "$work"' EXIT
+RUNTIME_DIR="$work"
+config="$work/sshd_config"
+printf 'PasswordAuthentication yes\nInclude conf.d/*.conf\n' > "$config"
+write_file_if_changed() { cat > "$1"; }
+set_ssh_global_key_only "$config"
+set_ssh_global_key_only "$config"
+[[ $(grep -c '^# BEGIN VPS SETUP KEY-ONLY AUTH$' "$config") == 1 ]]
+[[ $(awk '$1 == "PasswordAuthentication" {print $2; exit}' "$config") == no ]]
+grep -qx 'Include conf.d/\*.conf' "$config"
+''')
+
+
 class ListenerTests(unittest.TestCase):
     def endpoint_helpers(self):
         return "\n".join(helper(n) for n in (
@@ -103,6 +262,7 @@ class ListenerTests(unittest.TestCase):
             "read_ssh_socket_endpoints", "ssh_endpoints_for_ports",
             "assert_effective_ssh_endpoints", "assert_effective_ssh_socket_endpoints",
             "make_ssh_socket_dropin", "capture_ssh_listener_state",
+            "assert_ssh_service_preserves_sessions",
         ))
 
     def test_ipv4_ipv6_and_distinct_port_scopes(self):
@@ -175,6 +335,23 @@ systemctl() {
 capture_ssh_listener_state
 [[ $SSH_SOCKET_MODE == 0 ]]
 [[ ${SSH_CONFIG_ENDPOINTS[0]} == 127.0.0.1:22 ]]
+''')
+
+    def test_socket_preflight_rejects_unsafe_service_kill_mode(self):
+        bash(self.endpoint_helpers() + r'''
+set -euo pipefail
+sshd() { echo 'listenaddress 127.0.0.1:22'; }
+ssh_service_name() { echo ssh.service; }
+systemctl() {
+    case $1 in
+        is-active) return 0 ;;
+        show)
+            [[ $* == *'--property=KillMode'* ]] || return 91
+            echo control-group ;;
+        *) return 92 ;;
+    esac
+}
+if capture_ssh_listener_state; then exit 93; fi
 ''')
 
 

@@ -110,6 +110,7 @@ SSH_CHANGE_PORT=0
 SSH_CONFIG_ENDPOINTS=()
 SSH_SOCKET_ENDPOINTS=()
 SSH_PENDING_PORTS=()
+SSH_SOCKET_SERVICE_WAS_ACTIVE=0
 
 log()  { printf '[%s] %s\n' "$(date '+%F %T')" "$*"; }
 info() { printf '\n==> %s\n' "$*"; }
@@ -417,6 +418,12 @@ ssh_service_name() {
     fi
 }
 
+assert_ssh_service_preserves_sessions() {
+    local mode
+    mode=$(systemctl show "$1" --property=KillMode --value) || return 1
+    [[ $mode == process ]]
+}
+
 assert_effective_ssh_ports() {
     local expected actual
     expected=$(printf '%s\n' "$@" | sort -nu | paste -sd, -)
@@ -463,13 +470,17 @@ read_ssh_socket_endpoints() {
 }
 
 capture_ssh_listener_state() {
-    local effective
+    local effective service
     effective=$(sshd -T) || return 1
     read_ssh_config_endpoints "$effective" || return 1
     SSH_SOCKET_MODE=0
+    SSH_SOCKET_SERVICE_WAS_ACTIVE=0
     # Enabled-but-stopped sockets are not the current administrative endpoint.
     if systemctl is-active --quiet ssh.socket; then
         SSH_SOCKET_MODE=1
+        service=$(ssh_service_name) || return 1
+        assert_ssh_service_preserves_sessions "$service" || return 1
+        if systemctl is-active --quiet "$service"; then SSH_SOCKET_SERVICE_WAS_ACTIVE=1; fi
         read_ssh_socket_endpoints || return 1
         SSH_CONFIG_ENDPOINTS=("${SSH_SOCKET_ENDPOINTS[@]}")
     fi
@@ -533,15 +544,30 @@ neutralize_existing_ssh_listeners() {
 }
 
 reload_ssh() {
-    local service
-    systemctl daemon-reload
+    local service service_was_active=0
+    systemctl daemon-reload || return 1
+    service=$(ssh_service_name) || return 1
     if (( SSH_SOCKET_MODE )); then
+        assert_ssh_service_preserves_sessions "$service" || return 1
         if (( SSH_CHANGE_PORT )); then
             assert_effective_ssh_socket_endpoints || return 1
         fi
-        systemctl restart ssh.socket
+        if systemctl is-active --quiet "$service"; then
+            service_was_active=1
+        fi
+        if [[ ${1:-} == restore ]]; then
+            service_was_active=${SSH_SOCKET_SERVICE_WAS_ACTIVE:-0}
+        fi
+        # Stop both units in one systemd transaction: leaving the old socket
+        # active can race with an incoming connection and reactivate old FDs.
+        systemctl stop ssh.socket "$service" || return 1
+        systemctl start ssh.socket || return 1
+        # SIGHUP can discard inherited activation descriptors. Start a fresh
+        # master under KillMode=process so existing client sessions survive.
+        if (( service_was_active )); then
+            systemctl start "$service" || return 1
+        fi
     else
-        service=$(ssh_service_name) || return 1
         systemctl reload "$service" || systemctl restart "$service"
     fi
 }
@@ -566,7 +592,7 @@ rollback_ssh() {
         ufw --force delete allow "${SSH_NEW_PORT}/tcp" >/dev/null 2>&1 || true
     fi
     SSH_CHANGE_PORT=0
-    reload_ssh >/dev/null 2>&1 || true
+    reload_ssh restore >/dev/null 2>&1 || true
     SSH_TX_ACTIVE=0
     SSH_FINAL_PORTS=()
     CHANGES=("${CHANGES[@]:0:SSH_CHANGES_START}")
@@ -638,6 +664,98 @@ make_ssh_socket_dropin() {
         while IFS= read -r endpoint; do echo "ListenStream=$endpoint"; done \
             < <(ssh_endpoints_for_ports SSH_SOCKET_ENDPOINTS "$@")
     } | write_file_if_changed /etc/systemd/system/ssh.socket.d/00-setup.conf 0644
+}
+
+check_ssh_password_overrides() {
+    # Inspect the complete Include graph. Any conditional re-enable is unsafe
+    # for the requested policy covering ALL users, even outside our test login.
+    python3 - "$1" "$2" <<'POLICY_PY'
+import glob
+from pathlib import Path
+import re
+import shlex
+import sys
+
+root, include_root = map(Path, sys.argv[1:])
+conditional = False
+stack = set()
+auth_names = {"passwordauthentication", "kbdinteractiveauthentication", "challengeresponseauthentication"}
+
+def inspect(path, depth=0):
+    global conditional
+    resolved = path.resolve(strict=True)
+    if depth > 16 or resolved in stack:
+        raise ValueError(f"Recursive or excessively nested SSH Include: {path}")
+    stack.add(resolved)
+    try:
+        for number, line in enumerate(path.read_text().splitlines(), 1):
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            match = re.match(r"^\s*([A-Za-z][A-Za-z0-9]*)\s*(?:=\s*)?(.*)$", line)
+            if not match:
+                raise ValueError(f"Unsupported SSH syntax: {path}:{number}")
+            name, arguments = match.groups()
+            name = name.lower()
+            args = shlex.split(arguments, comments=True, posix=True)
+            if name == "match":
+                conditional = True
+            elif name == "include":
+                if not args:
+                    raise ValueError(f"Empty SSH Include: {path}:{number}")
+                # OpenSSH and shlex do not share every backslash escape rule.
+                if "\\" in arguments:
+                    raise ValueError(f"Unsupported escaped SSH Include: {path}:{number}")
+                for pattern in args:
+                    if any(char in pattern for char in "~$%"):
+                        raise ValueError(f"Unsupported SSH Include expansion: {path}:{number}")
+                    candidate = Path(pattern)
+                    if not candidate.is_absolute():
+                        candidate = include_root / candidate
+                    for child in sorted(glob.glob(str(candidate))):
+                        inspect(Path(child), depth + 1)
+            elif conditional and name in auth_names and args != ["no"]:
+                raise ValueError(f"Conditional password authentication must be resolved manually: {path}:{number}")
+    finally:
+        stack.remove(resolved)
+
+try:
+    inspect(root)
+except (OSError, ValueError) as error:
+    print(error, file=sys.stderr)
+    sys.exit(1)
+POLICY_PY
+}
+
+set_ssh_global_key_only() {
+    local config_path=${1:-/etc/ssh/sshd_config} tmp
+    tmp=$(mktemp "$RUNTIME_DIR/ssh-auth.XXXXXX")
+    {
+        echo '# BEGIN VPS SETUP KEY-ONLY AUTH'
+        echo 'PubkeyAuthentication yes'
+        echo 'PasswordAuthentication no'
+        echo 'KbdInteractiveAuthentication no'
+        echo '# END VPS SETUP KEY-ONLY AUTH'
+        awk '
+            $0 == "# BEGIN VPS SETUP KEY-ONLY AUTH" {if (managed) exit 1; managed=1; next}
+            $0 == "# END VPS SETUP KEY-ONLY AUTH" {if (!managed) exit 1; managed=0; next}
+            !managed {print}
+            END {if (managed) exit 1}
+        ' "$config_path"
+    } > "$tmp"
+    write_file_if_changed "$config_path" 0644 < "$tmp"
+    rm -f "$tmp"
+}
+
+assert_password_auth_disabled() {
+    local effective
+    effective=$(sshd -T) || return 1
+    awk '
+        $1 == "pubkeyauthentication" {key=($2 == "yes")}
+        $1 == "passwordauthentication" {password=($2 == "no")}
+        $1 == "kbdinteractiveauthentication" {keyboard=($2 == "no")}
+        END {exit !(key && password && keyboard)}
+    ' <<<"$effective" || return 1
+    check_ssh_password_overrides /etc/ssh/sshd_config /etc/ssh
 }
 
 configure_ssh() {
@@ -740,6 +858,12 @@ configure_ssh() {
         return 0
     fi
 
+    if (( disable_password )); then
+        install_packages python3
+        check_ssh_password_overrides /etc/ssh/sshd_config /etc/ssh || \
+            die "Cannot guarantee key-only authentication for all SSH users; resolve the reported SSH configuration first."
+    fi
+
     # Capture the full output first: early pipeline termination can produce SIGPIPE (141) with pipefail.
     sshd_effective=$(sshd -T)
     current_password=$(awk '$1 == "passwordauthentication" && !found {print $2; found=1}' <<<"$sshd_effective")
@@ -820,7 +944,7 @@ configure_ssh() {
     echo "Open a NEW local terminal and test the connection without closing the current session."
     if [[ -n $public_key ]]; then
         rendered_private_key=$(format_local_key_path "$local_private_key")
-        printf '  ssh -i %s -p %s %s@%s\n' \
+        printf '  ssh -F /dev/null -S none -o IdentitiesOnly=yes -o PreferredAuthentications=publickey -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no -i %s -p %s %s@%s\n' \
             "$rendered_private_key" "$desired_port" "$target_user" "$server_address"
     else
         printf '  ssh -p %s %s@%s\n' "$desired_port" "$target_user" "$server_address"
@@ -843,13 +967,17 @@ configure_ssh() {
 
     if (( disable_password )) && [[ -n $public_key ]]; then
         make_ssh_dropin no no "${final_ports[@]}"
-        CHANGES+=("Disabled SSH password login after key verification")
+        set_ssh_global_key_only
     else
         make_ssh_dropin "$current_password" "$current_kbd" "${final_ports[@]}"
     fi
     make_ssh_socket_dropin "${final_ports[@]}"
 
     sshd -t
+    if (( disable_password )) && ! assert_password_auth_disabled; then
+        rollback_ssh
+        die "Effective SSH authentication is not key-only for all users; changes were rolled back."
+    fi
     if ! assert_effective_ssh_endpoints "${final_ports[@]}"; then
         rollback_ssh
         die "Final SSH listener addresses or ports differ from the requested endpoints; changes were rolled back."
@@ -869,6 +997,18 @@ configure_ssh() {
                 die "Old SSH port $p is still listening; changes were rolled back."
             fi
         done
+    fi
+
+    if (( disable_password )); then
+        echo "Repeat the key-only SSH command above in a NEW local connection after the final policy change."
+        printf 'After successful key-only login, enter exactly YES; any other answer restores the previous SSH configuration: '
+        IFS= read -r confirm || true
+        if [[ $confirm != YES ]]; then
+            rollback_ssh
+            log "Final key-only login was not confirmed; SSH configuration restored (the added key is retained)."
+            return 0
+        fi
+        CHANGES+=("Disabled password and keyboard-interactive SSH authentication; effective policy and final key login verified")
     fi
 
     SSH_TX_ACTIVE=0

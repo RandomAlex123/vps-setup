@@ -105,6 +105,7 @@ SSH_SOCKET_MODE=0
 APT_UPDATED=0
 SSH_FINAL_PORTS=()
 SSH_CHANGES_START=0
+UFW_RULE_MODE="not configured by this run"
 
 log()  { printf '[%s] %s\n' "$(date '+%F %T')" "$*"; }
 info() { printf '\n==> %s\n' "$*"; }
@@ -757,12 +758,27 @@ configure_ssh() {
     log "SSH configuration completed successfully."
 }
 
+ufw_user_rules_are_ssh_only() {
+    local rules actual expected
+    rules=$(LC_ALL=C ufw show added) || return 1
+    actual=$(awk '/^ufw / {print}' <<<"$rules" | LC_ALL=C sort)
+    expected=$(printf 'ufw allow %s/tcp\n' "$@" | LC_ALL=C sort)
+    [[ $actual == "$expected" ]]
+}
+
+restore_ufw_state() {
+    local was_active=$1
+    restore_snapshot ufw_config_dir || return 1
+    restore_snapshot ufw_defaults || return 1
+    if (( was_active )); then ufw reload; else ufw --force disable; fi
+}
+
 configure_ufw() {
-    local was_active=0 failed=0 p
+    local was_active=0 failed=0 replace_rules=0 p
     local -a ports=()
 
     info "Firewall UFW"
-    if ! ask_yes_no "Configure and enable UFW while allowing only the current SSH ports?" Y; then
+    if ! ask_yes_no "Configure and enable UFW (keep existing rules unless replacement is selected)?" Y; then
         log "UFW configuration skipped."
         return 0
     fi
@@ -771,41 +787,49 @@ configure_ufw() {
     mapfile -t ports < <(get_active_ssh_ports_for_rules | sort -nu)
     ((${#ports[@]})) || ports=(22)
 
+    LC_ALL=C ufw status
+    warn "Keeping rules preserves ALL existing permits. Replacement removes existing UFW user and routed rules."
+    if ask_yes_no "Replace existing UFW rules with SSH-only TCP permits (this can disconnect other services)?" N; then
+        replace_rules=1
+    fi
+
     ufw_is_active && was_active=1
-    snapshot_path ufw_user_rules /etc/ufw/user.rules
-    snapshot_path ufw_user6_rules /etc/ufw/user6.rules
+    snapshot_path ufw_config_dir /etc/ufw
     snapshot_path ufw_defaults /etc/default/ufw
+    backup_file /etc/ufw
     backup_file /etc/default/ufw
 
-    if ! ufw default deny incoming; then failed=1; fi
+    if (( replace_rules )) && ! ufw --force reset; then failed=1; fi
+    if (( ! failed )) && ! ufw default deny incoming; then failed=1; fi
     if (( ! failed )) && ! ufw default allow outgoing; then failed=1; fi
+    if (( ! failed && replace_rules )) && ! ufw default deny routed; then failed=1; fi
     if (( ! failed )); then
         for p in "${ports[@]}"; do
             if ! ufw allow "${p}/tcp"; then failed=1; break; fi
         done
     fi
     if (( ! failed )) && ! ufw --force enable; then failed=1; fi
+    if (( ! failed && replace_rules )) && ! ufw_user_rules_are_ssh_only "${ports[@]}"; then failed=1; fi
 
     if (( failed )); then
-        restore_snapshot ufw_user_rules
-        restore_snapshot ufw_user6_rules
-        restore_snapshot ufw_defaults
-        if (( was_active )); then ufw reload || true; else ufw --force disable || true; fi
+        restore_ufw_state "$was_active" || die "UFW configuration failed AND automatic restoration failed; use the console and backups."
         die "UFW could not be configured safely; previous rules were restored."
     fi
 
     for p in "${ports[@]}"; do
         if ! ufw_has_explicit_port "$p"; then
-            restore_snapshot ufw_user_rules
-            restore_snapshot ufw_user6_rules
-            restore_snapshot ufw_defaults
-            if (( was_active )); then ufw reload || true; else ufw --force disable || true; fi
+            restore_ufw_state "$was_active" || die "UFW verification failed AND automatic restoration failed; use the console and backups."
             die "After enabling UFW, no allow rule was found for SSH port $p; changes were rolled back."
         fi
     done
 
-    CHANGES+=("UFW enabled: incoming traffic denied; allowed SSH ports: $(join_by , "${ports[@]}")")
-    echo "The script did not open ports 80, 443, or any VPN ports."
+    if (( replace_rules )); then
+        UFW_RULE_MODE="replaced user rules: SSH-only TCP permits; routed traffic denied"
+    else
+        UFW_RULE_MODE="existing rules preserved (other ports may remain open)"
+    fi
+    CHANGES+=("UFW enabled: $UFW_RULE_MODE; SSH ports: $(join_by , "${ports[@]}")")
+    echo "UFW policy: $UFW_RULE_MODE. Docker and external firewall rules are separate."
 }
 
 wait_for_fail2ban() {
@@ -1171,6 +1195,7 @@ final_checks() {
     echo "SSH config valid:   $ssh_ok"
     echo "SSH port(s):        $(join_by , "${ports[@]}")"
     echo "UFW:                $ufw_state"
+    echo "UFW rule mode:      $UFW_RULE_MODE"
     echo "Fail2ban:           $fail2ban_state"
     echo "Existing swap devices: ${existing_swap_mb} MB"
     echo "/swapfile size:        ${swapfile_mb} MB"
@@ -1199,7 +1224,7 @@ final_checks() {
     fi
 
     echo
-    echo "Ports 80, 443, and VPN panel ports were intentionally left closed."
+    echo "This script added no web/VPN port permits. Existing permits and Docker exposure depend on the selected policy."
     echo "3x-ui, Telemt, and AmneziaVPN were not installed."
 }
 

@@ -94,5 +94,71 @@ if add_user_ssh_key test-user "$work/home" BAD; then exit 92; fi
         self.assertNotIn('chown "$user_uid:$user_gid"', SOURCE)
 
 
+class FirewallTests(unittest.TestCase):
+    def test_ssh_only_verifier_rejects_previous_and_routed_rules(self):
+        bash(helper("ufw_user_rules_are_ssh_only") + r'''
+set -euo pipefail
+ufw() { printf '%s\n' 'Added user rules:' "$RULES"; }
+RULES=$'ufw allow 22/tcp\nufw allow 2222/tcp'
+ufw_user_rules_are_ssh_only 22 2222
+RULES+=$'\nufw allow 443/tcp'
+if ufw_user_rules_are_ssh_only 22 2222; then exit 11; fi
+RULES=$'ufw allow 22/tcp\nufw route allow in on tun0'
+if ufw_user_rules_are_ssh_only 22; then exit 12; fi
+''')
+
+    def test_preserve_replace_and_failure_restore(self):
+        script = "\n".join(helper(n) for n in (
+            "configure_ufw", "restore_ufw_state", "ufw_user_rules_are_ssh_only", "join_by"
+        )) + r'''
+set -euo pipefail
+CHANGES=()
+info() { :; }; warn() { :; }; install_packages() { :; }
+backup_file() { :; }; snapshot_path() { printf 'snapshot %s\n' "$1" >> "$TRACE"; }
+restore_snapshot() { printf 'restore %s\n' "$1" >> "$TRACE"; }
+get_active_ssh_ports_for_rules() { echo 22; }
+ufw_is_active() { [[ $ACTIVE == 1 ]]; }
+ufw_has_explicit_port() { return 0; }
+ask_yes_no() {
+    if [[ $1 == Replace* ]]; then [[ $REPLACE == 1 ]]; else return 0; fi
+}
+ufw() {
+    printf 'ufw %s\n' "$*" >> "$TRACE"
+    if [[ $* == 'show added' ]]; then
+        echo 'ufw allow 22/tcp'
+    elif [[ $* == 'default allow outgoing' && $FAIL == 1 ]]; then
+        return 1
+    fi
+}
+die() { echo "$*" >&2; exit 73; }
+work=$(mktemp -d)
+trap 'rm -rf -- "$work"' EXIT
+TRACE="$work/trace"
+REPLACE=0 ACTIVE=1 FAIL=0
+configure_ufw
+! grep -q 'ufw --force reset' "$TRACE"
+[[ $UFW_RULE_MODE == *preserved* ]]
+REPLACE=1
+: > "$TRACE"
+configure_ufw
+grep -q 'ufw --force reset' "$TRACE"
+grep -q 'ufw default deny routed' "$TRACE"
+[[ $UFW_RULE_MODE == *SSH-only* ]]
+for ACTIVE in 0 1; do
+    FAIL=1
+    : > "$TRACE"
+    if (configure_ufw); then exit 14; fi
+    grep -q 'restore ufw_config_dir' "$TRACE"
+    grep -q 'restore ufw_defaults' "$TRACE"
+    if [[ $ACTIVE == 1 ]]; then
+        grep -q 'ufw reload' "$TRACE"
+    else
+        grep -q 'ufw --force disable' "$TRACE"
+    fi
+done
+'''
+        bash(script)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

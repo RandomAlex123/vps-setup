@@ -451,7 +451,6 @@ ufw_has_explicit_port() {
 
 rollback_ssh() {
     set +e
-    restore_snapshot ssh_user_dir
     restore_snapshot ssh_socket_dropin
     restore_snapshot ssh_etc_dir
 
@@ -464,6 +463,45 @@ rollback_ssh() {
     CHANGES=("${CHANGES[@]:0:SSH_CHANGES_START}")
     set -e
     warn "Incomplete SSH changes were rolled back."
+}
+
+add_user_ssh_key() {
+    local account=$1 home=$2 key=$3
+
+    # Never use root authority to write through a user-controlled home path.
+    # Keep the key on SSH configuration rollback so that recovery access remains.
+    runuser -u "$account" -- bash --noprofile --norc -s -- "$home" "$key" "$RUN_ID" <<'KEY_SCRIPT'
+set -euo pipefail
+umask 077
+cd -- "$1"
+[[ ! -L .ssh && ( ! -e .ssh || -d .ssh ) ]] || {
+    echo 'Refusing a symlink or non-directory .ssh.' >&2; exit 1;
+}
+mkdir -p -- .ssh
+cd -P -- .ssh
+[[ $(stat -c %u .) == "$EUID" ]] || {
+    echo 'The selected user must own .ssh.' >&2; exit 1;
+}
+chmod 0700 .
+[[ ! -L authorized_keys && ( ! -e authorized_keys || -f authorized_keys ) ]] || {
+    echo 'Refusing a symlink or non-regular authorized_keys.' >&2; exit 1;
+}
+if [[ -e authorized_keys ]]; then
+    [[ $(stat -c %u authorized_keys) == "$EUID" && $(stat -c %h authorized_keys) == 1 ]] || {
+        echo 'authorized_keys must be owned by the selected user and have one link.' >&2; exit 1;
+    }
+    cp -p --no-clobber -- authorized_keys "authorized_keys.setup-backup-$3"
+fi
+touch -- authorized_keys
+chmod 0600 authorized_keys
+if ! grep -qxF -- "$2" authorized_keys; then
+    # Separate a valid last key lacking a trailing newline from the new key.
+    if [[ -s authorized_keys && $(tail -c 1 authorized_keys | wc -l) == 0 ]]; then
+        printf '\n' >> authorized_keys
+    fi
+    printf '%s\n' "$2" >> authorized_keys
+fi
+KEY_SCRIPT
 }
 
 make_ssh_dropin() {
@@ -490,7 +528,7 @@ make_ssh_socket_dropin() {
 }
 
 configure_ssh() {
-    local default_user target_user user_home user_uid user_gid
+    local default_user target_user user_home
     local public_key="" key_tmp key_type local_private_key="" default_private_key
     local rendered_private_key current_password current_kbd sshd_effective disable_password=0
     local change_port=0 desired_port primary_port server_address confirm
@@ -517,8 +555,6 @@ configure_ssh() {
     target_user=${target_user:-$default_user}
     getent passwd "$target_user" >/dev/null || die "User '$target_user' does not exist."
     user_home=$(getent passwd "$target_user" | cut -d: -f6)
-    user_uid=$(id -u "$target_user")
-    user_gid=$(id -g "$target_user")
     [[ -d $user_home ]] || die "User home directory was not found: $user_home"
 
     if ask_yes_no "Add a public SSH key for '$target_user'?" Y; then
@@ -605,7 +641,6 @@ configure_ssh() {
 
     snapshot_path ssh_etc_dir /etc/ssh
     snapshot_path ssh_socket_dropin /etc/systemd/system/ssh.socket.d/00-setup.conf
-    snapshot_path ssh_user_dir "$user_home/.ssh"
     backup_file /etc/ssh
 
     if ! grep -Eq '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf' /etc/ssh/sshd_config; then
@@ -619,17 +654,9 @@ configure_ssh() {
     fi
 
     if [[ -n $public_key ]]; then
-        backup_file "$user_home/.ssh/authorized_keys"
-        install -d -m 0700 -o "$user_uid" -g "$user_gid" "$user_home/.ssh"
-        touch "$user_home/.ssh/authorized_keys"
-        chown "$user_uid:$user_gid" "$user_home/.ssh/authorized_keys"
-        chmod 0600 "$user_home/.ssh/authorized_keys"
-        if ! grep -qxF -- "$public_key" "$user_home/.ssh/authorized_keys"; then
-            printf '%s\n' "$public_key" >> "$user_home/.ssh/authorized_keys"
-            CHANGES+=("Added an SSH key for $target_user")
-        else
-            log "The SSH key is already present."
-        fi
+        install_packages util-linux
+        add_user_ssh_key "$target_user" "$user_home" "$public_key"
+        CHANGES+=("Installed SSH key for $target_user (retained on SSH configuration rollback)")
     fi
 
     if (( change_port )); then

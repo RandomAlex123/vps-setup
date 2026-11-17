@@ -3,10 +3,13 @@
 .env
 .env.*
 
+.ssh/
+
 *.pem
 *.key
 id_rsa
 id_ed25519
+test_ed25519
 
 backups/
 

@@ -794,6 +794,19 @@ configure_ssh() {
     [[ -d $user_home ]] || die "User home directory was not found: $user_home"
 
     if ask_yes_no "Add a public SSH key for '$target_user'?" Y; then
+        cat <<'KEY_HELP'
+If you already have an SSH key, use its .pub file; you do not need a new key.
+Otherwise, open Git Bash on your LOCAL computer (not this VPS) and run:
+  ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -C "vps-access"
+ssh-keygen creates a key pair; -t selects Ed25519; -f sets the private-key file;
+-C adds a descriptive comment. Choose a passphrase to protect the key.
+Do not overwrite an existing key: use it or change the path after -f.
+To display the public key, run on your LOCAL computer:
+  cat ~/.ssh/id_ed25519.pub
+cat prints the file; ~ is your local home directory. If you chose another
+filename, use that filename with .pub appended instead.
+Copy the entire public-key line below. Never paste the private file without .pub.
+KEY_HELP
         while true; do
             echo "Paste one public key line (ssh-ed25519/ssh-rsa/ecdsa/...):"
             IFS= read -r public_key || true
